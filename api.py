@@ -1,10 +1,20 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware # <-- ADDED THIS
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
 app = FastAPI(title="Fraud Detection API")
+
+# --- ADDED CORS MIDDLEWARE ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows your React app (and anyone else) to connect
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- 1. Load Data and Train Model on Startup ---
 print("Loading data and training model...")
