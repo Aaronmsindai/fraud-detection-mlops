@@ -14,10 +14,9 @@ from sklearn.ensemble import RandomForestClassifier
 # ==========================================
 # 1. DATABASE SETUP & PSYCOPG2 FIX
 # ==========================================
-# Get DB URL from Render's Environment Variables
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/fraud_db")
 
-# CRITICAL FIX: Force SQLAlchemy to use the psycopg2 driver
+# Force SQLAlchemy to use psycopg2 driver
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
@@ -51,7 +50,7 @@ Base.metadata.create_all(bind=engine)
 # ==========================================
 # 3. SECURITY & JWT SETUP
 # ==========================================
-SECRET_KEY = "super_secret_bank_key_123" # In production, use a secure random string
+SECRET_KEY = "super_secret_bank_key_123"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -82,7 +81,6 @@ def create_access_token(data: dict):
 # ==========================================
 print("Loading data and training model...")
 try:
-    # Load a sample of the data to train quickly on startup
     df = pd.read_csv("transactions.csv").sample(n=100000, random_state=42)
     X = df[['amount', 'hour_of_day', 'user_age', 'is_international']]
     y = df['is_fraud']
@@ -94,7 +92,7 @@ except Exception as e:
     print(f"Error loading model: {e}")
 
 # ==========================================
-# 5. PYDANTIC SCHEMAS
+# 5. PYDANTIC SCHEMAS (Updated for Pydantic V2)
 # ==========================================
 class TransactionInput(BaseModel):
     amount: float
@@ -108,7 +106,7 @@ class TransactionResponse(BaseModel):
     timestamp: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True # <--- This is the Pydantic V2 fix
 
 class UserCreate(BaseModel):
     username: str
@@ -121,7 +119,7 @@ app = FastAPI(title="Bank Fraud Detection API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your Vercel URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -166,7 +164,6 @@ def predict_fraud(
     db: Session = Depends(get_db), 
     token: str = Depends(oauth2_scheme)
 ):
-    # 1. Verify the JWT Token
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
@@ -175,7 +172,6 @@ def predict_fraud(
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # 2. Make the ML Prediction
     input_data = pd.DataFrame([{
         'amount': tx.amount,
         'hour_of_day': tx.hour_of_day,
@@ -187,7 +183,6 @@ def predict_fraud(
     probability = float(model.predict_proba(input_data)[0][1])
     result = "FRAUD DETECTED" if prediction == 1 else "SAFE"
     
-    # 3. Save the Transaction to PostgreSQL
     new_tx = Transaction(
         amount=tx.amount,
         hour_of_day=tx.hour_of_day,
@@ -197,7 +192,7 @@ def predict_fraud(
     )
     db.add(new_tx)
     db.commit()
-    db.refresh(new_tx) # Get the generated timestamp from the DB
+    db.refresh(new_tx)
     
     return {
         "prediction": result,
