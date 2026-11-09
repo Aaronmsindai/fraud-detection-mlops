@@ -2,28 +2,34 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from typing import List
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
+from sklearn.ensemble import RandomForestClassifier
 
-# --- 1. Database Setup ---
-# THE DATABASE URL WILL BE READ FROM RENDER'S ENVIRONMENT VARIABLES
+# ==========================================
+# 1. DATABASE SETUP & PSYCOPG2 FIX
+# ==========================================
+# Get DB URL from Render's Environment Variables
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/fraud_db")
 
-# Fix for Render's postgres:// vs postgresql:// issue
+# CRITICAL FIX: Force SQLAlchemy to use the psycopg2 driver
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- 2. Database Models ---
+# ==========================================
+# 2. DATABASE MODELS
+# ==========================================
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -42,10 +48,12 @@ class Transaction(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# --- 3. Security & JWT Setup ---
-SECRET_KEY = "super_secret_bank_key_123" # In production, use os.getenv()
+# ==========================================
+# 3. SECURITY & JWT SETUP
+# ==========================================
+SECRET_KEY = "super_secret_bank_key_123" # In production, use a secure random string
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -69,18 +77,25 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# --- 4. Load ML Model ---
+# ==========================================
+# 4. MACHINE LEARNING MODEL SETUP
+# ==========================================
 print("Loading data and training model...")
-df = pd.read_csv("transactions.csv").sample(n=100000, random_state=42)
-X = df[['amount', 'hour_of_day', 'user_age', 'is_international']]
-y = df['is_fraud']
+try:
+    # Load a sample of the data to train quickly on startup
+    df = pd.read_csv("transactions.csv").sample(n=100000, random_state=42)
+    X = df[['amount', 'hour_of_day', 'user_age', 'is_international']]
+    y = df['is_fraud']
 
-from sklearn.ensemble import RandomForestClassifier
-model = RandomForestClassifier(n_estimators=50, random_state=42)
-model.fit(X, y)
-print("Model trained and ready for inference!")
+    model = RandomForestClassifier(n_estimators=50, random_state=42)
+    model.fit(X, y)
+    print("Model trained and ready for inference!")
+except Exception as e:
+    print(f"Error loading model: {e}")
 
-# --- 5. Pydantic Schemas ---
+# ==========================================
+# 5. PYDANTIC SCHEMAS
+# ==========================================
 class TransactionInput(BaseModel):
     amount: float
     hour_of_day: int
@@ -99,18 +114,26 @@ class UserCreate(BaseModel):
     username: str
     password: str
 
-# --- 6. FastAPI App ---
+# ==========================================
+# 6. FASTAPI APP & MIDDLEWARE
+# ==========================================
 app = FastAPI(title="Bank Fraud Detection API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # In production, restrict this to your Vercel URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 7. Routes ---
+# ==========================================
+# 7. API ROUTES
+# ==========================================
+
+@app.get("/")
+def health_check():
+    return {"status": "Bank API is running securely"}
 
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -128,14 +151,22 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/predict", response_model=TransactionResponse)
-def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
-    # 1. Verify the token
+def predict_fraud(
+    tx: TransactionInput, 
+    db: Session = Depends(get_db), 
+    token: str = Depends(oauth2_scheme)
+):
+    # 1. Verify the JWT Token
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
@@ -144,7 +175,7 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), token: st
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # 2. Make prediction
+    # 2. Make the ML Prediction
     input_data = pd.DataFrame([{
         'amount': tx.amount,
         'hour_of_day': tx.hour_of_day,
@@ -156,7 +187,7 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), token: st
     probability = float(model.predict_proba(input_data)[0][1])
     result = "FRAUD DETECTED" if prediction == 1 else "SAFE"
     
-    # 3. Save to Database!
+    # 3. Save the Transaction to PostgreSQL
     new_tx = Transaction(
         amount=tx.amount,
         hour_of_day=tx.hour_of_day,
@@ -166,13 +197,10 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), token: st
     )
     db.add(new_tx)
     db.commit()
+    db.refresh(new_tx) # Get the generated timestamp from the DB
     
     return {
         "prediction": result,
         "fraud_probability": round(probability * 100, 2),
         "timestamp": new_tx.timestamp
     }
-
-@app.get("/")
-def health_check():
-    return {"status": "Bank API is running securely"}
