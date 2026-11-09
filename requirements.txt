@@ -1,9 +1,9 @@
-pyspark
-xgboost
-imbalanced-learn
-pandas
-numpy
-scikit-learn
 fastapi
 uvicorn
-shap
+pandas
+scikit-learn
+sqlalchemy
+psycopg2-binary
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
