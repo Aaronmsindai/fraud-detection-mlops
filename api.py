@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
-from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 
 # ==========================================
 # 1. DATABASE SETUP & PSYCOPG2 FIX
@@ -34,6 +34,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
+    role = Column(String, default="teller") # <--- ADDED ROLE
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -76,16 +77,40 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+# Role Checker Dependency
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        role = payload.get("role")
+        if username is None or role is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"username": username, "role": role}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def get_current_admin_user(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not enough permissions. Admin only.")
+    return current_user
+
 # ==========================================
-# 4. MACHINE LEARNING MODEL SETUP (No SHAP)
+# 4. MACHINE LEARNING MODEL SETUP (XGBoost)
 # ==========================================
-print("Loading data and training model...")
+print("Loading data and training XGBoost model...")
 try:
     df = pd.read_csv("transactions.csv").sample(n=100000, random_state=42)
     X = df[['amount', 'hour_of_day', 'user_age', 'is_international']]
     y = df['is_fraud']
 
-    model = RandomForestClassifier(n_estimators=50, random_state=42)
+    # UPGRADED TO XGBOOST
+    model = xgb.XGBClassifier(
+        n_estimators=100, 
+        learning_rate=0.1, 
+        max_depth=3, 
+        random_state=42, 
+        eval_metric='logloss'
+    )
     model.fit(X, y)
     print("Model trained and ready for inference!")
 except Exception as e:
@@ -148,10 +173,14 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Username already registered")
     
     hashed_pw = get_password_hash(user.password)
-    new_user = User(username=user.username, hashed_password=hashed_pw)
+    
+    # First user named 'admin' becomes admin, others are tellers
+    assigned_role = "admin" if user.username.lower() == "admin" else "teller"
+    
+    new_user = User(username=user.username, hashed_password=hashed_pw, role=assigned_role)
     db.add(new_user)
     db.commit()
-    return {"message": "User created successfully"}
+    return {"message": f"User created successfully as {assigned_role}"}
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -163,23 +192,16 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer"}
+    # Include role in the token
+    access_token = create_access_token(data={"sub": user.username, "role": user.role})
+    return {"access_token": access_token, "token_type": "bearer", "role": user.role}
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(
     tx: TransactionInput, 
     db: Session = Depends(get_db), 
-    token: str = Depends(oauth2_scheme)
+    current_user: dict = Depends(get_current_user) # Uses the new dependency
 ):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
     input_data = pd.DataFrame([{
         'amount': tx.amount,
         'hour_of_day': tx.hour_of_day,
@@ -221,17 +243,15 @@ def predict_fraud(
         "risk_factors": top_reasons
     }
 
-# ==========================================
-# 8. HISTORY ENDPOINT
-# ==========================================
 @app.get("/history", response_model=List[HistoryItem])
-def get_history(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("sub") is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
+def get_history(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     transactions = db.query(Transaction).order_by(Transaction.timestamp.desc()).limit(10).all()
     return transactions
+
+# ==========================================
+# 8. ADMIN-ONLY ENDPOINT (Proves RBAC)
+# ==========================================
+@app.get("/admin/users")
+def get_all_users(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
+    users = db.query(User).all()
+    return [{"id": u.id, "username": u.username, "role": u.role} for u in users]
