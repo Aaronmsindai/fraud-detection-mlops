@@ -34,11 +34,12 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
-    role = Column(String, default="teller") # <--- ADDED ROLE
+    role = Column(String, default="teller")
 
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
+    card_number = Column(String) # <--- ADDED CARD NUMBER
     amount = Column(Float)
     hour_of_day = Column(Integer)
     user_age = Column(Integer)
@@ -77,7 +78,6 @@ def create_access_token(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# Role Checker Dependency
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -103,7 +103,6 @@ try:
     X = df[['amount', 'hour_of_day', 'user_age', 'is_international']]
     y = df['is_fraud']
 
-    # UPGRADED TO XGBOOST
     model = xgb.XGBClassifier(
         n_estimators=100, 
         learning_rate=0.1, 
@@ -120,6 +119,7 @@ except Exception as e:
 # 5. PYDANTIC SCHEMAS
 # ==========================================
 class TransactionInput(BaseModel):
+    card_number: str # <--- ADDED CARD NUMBER
     amount: float
     hour_of_day: int
     user_age: int
@@ -132,6 +132,7 @@ class PredictionResponse(BaseModel):
     risk_factors: Dict[str, float]
 
 class HistoryItem(BaseModel):
+    card_number: str # <--- ADDED CARD NUMBER
     amount: float
     hour_of_day: int
     user_age: int
@@ -173,8 +174,6 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Username already registered")
     
     hashed_pw = get_password_hash(user.password)
-    
-    # First user named 'admin' becomes admin, others are tellers
     assigned_role = "admin" if user.username.lower() == "admin" else "teller"
     
     new_user = User(username=user.username, hashed_password=hashed_pw, role=assigned_role)
@@ -192,7 +191,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Include role in the token
     access_token = create_access_token(data={"sub": user.username, "role": user.role})
     return {"access_token": access_token, "token_type": "bearer", "role": user.role}
 
@@ -200,8 +198,16 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 def predict_fraud(
     tx: TransactionInput, 
     db: Session = Depends(get_db), 
-    current_user: dict = Depends(get_current_user) # Uses the new dependency
+    current_user: dict = Depends(get_current_user)
 ):
+    # --- 1. RULE ENGINE: VELOCITY CHECK ---
+    one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
+    recent_txs = db.query(Transaction).filter(
+        Transaction.card_number == tx.card_number,
+        Transaction.timestamp >= one_minute_ago
+    ).count()
+
+    # --- 2. MACHINE LEARNING MODEL ---
     input_data = pd.DataFrame([{
         'amount': tx.amount,
         'hour_of_day': tx.hour_of_day,
@@ -213,7 +219,7 @@ def predict_fraud(
     probability = float(model.predict_proba(input_data)[0][1])
     result = "FRAUD DETECTED" if prediction == 1 else "SAFE"
     
-    # --- LIGHTWEIGHT EXPLAINABILITY ---
+    # --- 3. EXPLAINABILITY ---
     importances = model.feature_importances_
     feature_names = ['amount', 'hour_of_day', 'user_age', 'is_international']
     
@@ -224,8 +230,16 @@ def predict_fraud(
             
     top_reasons = dict(sorted(explanations.items(), key=lambda item: item[1], reverse=True)[:2])
     
-    # --- SAVE TO DATABASE ---
+    # --- 4. OVERRIDE WITH RULE ENGINE ---
+    if recent_txs >= 3:
+        result = "FRAUD DETECTED"
+        probability = 99.9
+        # Add the rule to the top reasons
+        top_reasons = {"Velocity Rule (3+ tx/min)": 10.0, **top_reasons}
+
+    # --- 5. SAVE TO DATABASE ---
     new_tx = Transaction(
+        card_number=tx.card_number,
         amount=tx.amount,
         hour_of_day=tx.hour_of_day,
         user_age=tx.user_age,
@@ -248,9 +262,6 @@ def get_history(db: Session = Depends(get_db), current_user: dict = Depends(get_
     transactions = db.query(Transaction).order_by(Transaction.timestamp.desc()).limit(10).all()
     return transactions
 
-# ==========================================
-# 8. ADMIN-ONLY ENDPOINT (Proves RBAC)
-# ==========================================
 @app.get("/admin/users")
 def get_all_users(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
     users = db.query(User).all()
