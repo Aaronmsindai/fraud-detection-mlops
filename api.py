@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
+from typing import List # <--- ADDED THIS
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -92,7 +93,7 @@ except Exception as e:
     print(f"Error loading model: {e}")
 
 # ==========================================
-# 5. PYDANTIC SCHEMAS (Updated for Pydantic V2)
+# 5. PYDANTIC SCHEMAS
 # ==========================================
 class TransactionInput(BaseModel):
     amount: float
@@ -106,7 +107,7 @@ class TransactionResponse(BaseModel):
     timestamp: datetime
 
     class Config:
-        from_attributes = True # <--- This is the Pydantic V2 fix
+        from_attributes = True
 
 class UserCreate(BaseModel):
     username: str
@@ -199,3 +200,20 @@ def predict_fraud(
         "fraud_probability": round(probability * 100, 2),
         "timestamp": new_tx.timestamp
     }
+
+# ==========================================
+# 8. NEW HISTORY ENDPOINT
+# ==========================================
+@app.get("/history", response_model=List[TransactionResponse])
+def get_history(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
+    # Verify the JWT token
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("sub") is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    # Fetch the last 10 transactions from the database, newest first
+    transactions = db.query(Transaction).order_by(Transaction.timestamp.desc()).limit(10).all()
+    return transactions
