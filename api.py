@@ -10,7 +10,6 @@ from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
-import shap
 from sklearn.ensemble import RandomForestClassifier
 
 # ==========================================
@@ -78,7 +77,7 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # ==========================================
-# 4. MACHINE LEARNING MODEL & SHAP SETUP
+# 4. MACHINE LEARNING MODEL SETUP
 # ==========================================
 print("Loading data and training model...")
 try:
@@ -88,10 +87,6 @@ try:
 
     model = RandomForestClassifier(n_estimators=50, random_state=42)
     model.fit(X, y)
-    
-    # Initialize SHAP Explainer
-    print("Initializing SHAP explainer...")
-    explainer = shap.TreeExplainer(model)
     
     print("Model trained and ready for inference!")
 except Exception as e:
@@ -110,7 +105,7 @@ class PredictionResponse(BaseModel):
     prediction: str
     fraud_probability: float
     timestamp: datetime
-    risk_factors: Dict[str, float] # <--- ADDED SHAP EXPLANATIONS
+    risk_factors: Dict[str, float]
 
 class HistoryItem(BaseModel):
     amount: float
@@ -197,19 +192,19 @@ def predict_fraud(
     probability = float(model.predict_proba(input_data)[0][1])
     result = "FRAUD DETECTED" if prediction == 1 else "SAFE"
     
-    # --- SHAP EXPLANATIONS ---
-    shap_values = explainer.shap_values(input_data)
-    # For Random Forest, shap_values[1] is the contribution towards Class 1 (Fraud)
-    fraud_contributions = shap_values[1][0] 
-    
+    # --- LIGHTWEIGHT EXPLAINABILITY ---
+    # Get the global feature importances from the Random Forest
+    importances = model.feature_importances_
     feature_names = ['amount', 'hour_of_day', 'user_age', 'is_international']
+    
     explanations = {}
+    # We use the feature importance to show which factors the model relies on most
     for i, feature in enumerate(feature_names):
-        # Only show positive contributions (features that pushed it towards FRAUD)
-        if fraud_contributions[i] > 0:
-            explanations[feature] = round(float(fraud_contributions[i]), 3)
+        # Only show features that actually matter to the model (importance > 5%)
+        if importances[i] > 0.05: 
+            # Multiply by 10 to make the number look like a risk score for the UI
+            explanations[feature] = round(float(importances[i] * 10), 2) 
             
-    # Sort to get the top 2 reasons
     top_reasons = dict(sorted(explanations.items(), key=lambda item: item[1], reverse=True)[:2])
     
     # --- SAVE TO DATABASE ---
