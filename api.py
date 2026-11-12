@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from typing import List # <--- ADDED THIS
+from typing import List
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -17,7 +17,6 @@ from sklearn.ensemble import RandomForestClassifier
 # ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/fraud_db")
 
-# Force SQLAlchemy to use psycopg2 driver
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
@@ -93,7 +92,7 @@ except Exception as e:
     print(f"Error loading model: {e}")
 
 # ==========================================
-# 5. PYDANTIC SCHEMAS
+# 5. PYDANTIC SCHEMAS (Fixed!)
 # ==========================================
 class TransactionInput(BaseModel):
     amount: float
@@ -101,9 +100,18 @@ class TransactionInput(BaseModel):
     user_age: int
     is_international: int
 
-class TransactionResponse(BaseModel):
+# Schema specifically for the /predict endpoint
+class PredictionResponse(BaseModel):
     prediction: str
     fraud_probability: float
+    timestamp: datetime
+
+# Schema specifically for the /history endpoint (matches DB exactly)
+class HistoryItem(BaseModel):
+    amount: float
+    hour_of_day: int
+    user_age: int
+    prediction: str
     timestamp: datetime
 
     class Config:
@@ -159,7 +167,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-@app.post("/predict", response_model=TransactionResponse)
+@app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(
     tx: TransactionInput, 
     db: Session = Depends(get_db), 
@@ -204,9 +212,8 @@ def predict_fraud(
 # ==========================================
 # 8. NEW HISTORY ENDPOINT
 # ==========================================
-@app.get("/history", response_model=List[TransactionResponse])
+@app.get("/history", response_model=List[HistoryItem])
 def get_history(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
-    # Verify the JWT token
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("sub") is None:
@@ -214,6 +221,5 @@ def get_history(db: Session = Depends(get_db), token: str = Depends(oauth2_schem
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # Fetch the last 10 transactions from the database, newest first
     transactions = db.query(Transaction).order_by(Transaction.timestamp.desc()).limit(10).all()
     return transactions
