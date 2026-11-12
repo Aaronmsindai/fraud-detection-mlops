@@ -77,7 +77,7 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # ==========================================
-# 4. MACHINE LEARNING MODEL SETUP
+# 4. MACHINE LEARNING MODEL SETUP (No SHAP)
 # ==========================================
 print("Loading data and training model...")
 try:
@@ -87,7 +87,6 @@ try:
 
     model = RandomForestClassifier(n_estimators=50, random_state=42)
     model.fit(X, y)
-    
     print("Model trained and ready for inference!")
 except Exception as e:
     print(f"Error loading model: {e}")
@@ -193,16 +192,12 @@ def predict_fraud(
     result = "FRAUD DETECTED" if prediction == 1 else "SAFE"
     
     # --- LIGHTWEIGHT EXPLAINABILITY ---
-    # Get the global feature importances from the Random Forest
     importances = model.feature_importances_
     feature_names = ['amount', 'hour_of_day', 'user_age', 'is_international']
     
     explanations = {}
-    # We use the feature importance to show which factors the model relies on most
     for i, feature in enumerate(feature_names):
-        # Only show features that actually matter to the model (importance > 5%)
         if importances[i] > 0.05: 
-            # Multiply by 10 to make the number look like a risk score for the UI
             explanations[feature] = round(float(importances[i] * 10), 2) 
             
     top_reasons = dict(sorted(explanations.items(), key=lambda item: item[1], reverse=True)[:2])
@@ -227,7 +222,7 @@ def predict_fraud(
     }
 
 # ==========================================
-# 8. NEW HISTORY ENDPOINT
+# 8. HISTORY ENDPOINT
 # ==========================================
 @app.get("/history", response_model=List[HistoryItem])
 def get_history(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)):
