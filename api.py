@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
+import shap
 from sklearn.ensemble import RandomForestClassifier
 
 # ==========================================
@@ -77,7 +78,7 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # ==========================================
-# 4. MACHINE LEARNING MODEL SETUP
+# 4. MACHINE LEARNING MODEL & SHAP SETUP
 # ==========================================
 print("Loading data and training model...")
 try:
@@ -87,12 +88,17 @@ try:
 
     model = RandomForestClassifier(n_estimators=50, random_state=42)
     model.fit(X, y)
+    
+    # Initialize SHAP Explainer
+    print("Initializing SHAP explainer...")
+    explainer = shap.TreeExplainer(model)
+    
     print("Model trained and ready for inference!")
 except Exception as e:
     print(f"Error loading model: {e}")
 
 # ==========================================
-# 5. PYDANTIC SCHEMAS (Fixed!)
+# 5. PYDANTIC SCHEMAS
 # ==========================================
 class TransactionInput(BaseModel):
     amount: float
@@ -100,13 +106,12 @@ class TransactionInput(BaseModel):
     user_age: int
     is_international: int
 
-# Schema specifically for the /predict endpoint
 class PredictionResponse(BaseModel):
     prediction: str
     fraud_probability: float
     timestamp: datetime
+    risk_factors: Dict[str, float] # <--- ADDED SHAP EXPLANATIONS
 
-# Schema specifically for the /history endpoint (matches DB exactly)
 class HistoryItem(BaseModel):
     amount: float
     hour_of_day: int
@@ -192,6 +197,22 @@ def predict_fraud(
     probability = float(model.predict_proba(input_data)[0][1])
     result = "FRAUD DETECTED" if prediction == 1 else "SAFE"
     
+    # --- SHAP EXPLANATIONS ---
+    shap_values = explainer.shap_values(input_data)
+    # For Random Forest, shap_values[1] is the contribution towards Class 1 (Fraud)
+    fraud_contributions = shap_values[1][0] 
+    
+    feature_names = ['amount', 'hour_of_day', 'user_age', 'is_international']
+    explanations = {}
+    for i, feature in enumerate(feature_names):
+        # Only show positive contributions (features that pushed it towards FRAUD)
+        if fraud_contributions[i] > 0:
+            explanations[feature] = round(float(fraud_contributions[i]), 3)
+            
+    # Sort to get the top 2 reasons
+    top_reasons = dict(sorted(explanations.items(), key=lambda item: item[1], reverse=True)[:2])
+    
+    # --- SAVE TO DATABASE ---
     new_tx = Transaction(
         amount=tx.amount,
         hour_of_day=tx.hour_of_day,
@@ -206,7 +227,8 @@ def predict_fraud(
     return {
         "prediction": result,
         "fraud_probability": round(probability * 100, 2),
-        "timestamp": new_tx.timestamp
+        "timestamp": new_tx.timestamp,
+        "risk_factors": top_reasons
     }
 
 # ==========================================
