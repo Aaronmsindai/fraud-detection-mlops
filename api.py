@@ -6,7 +6,7 @@ from typing import List, Dict
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
@@ -39,7 +39,7 @@ class User(Base):
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
-    card_number = Column(String) # <--- ADDED CARD NUMBER
+    card_number = Column(String)
     amount = Column(Float)
     hour_of_day = Column(Integer)
     user_age = Column(Integer)
@@ -119,7 +119,7 @@ except Exception as e:
 # 5. PYDANTIC SCHEMAS
 # ==========================================
 class TransactionInput(BaseModel):
-    card_number: str # <--- ADDED CARD NUMBER
+    card_number: str
     amount: float
     hour_of_day: int
     user_age: int
@@ -132,7 +132,7 @@ class PredictionResponse(BaseModel):
     risk_factors: Dict[str, float]
 
 class HistoryItem(BaseModel):
-    card_number: str # <--- ADDED CARD NUMBER
+    card_number: str
     amount: float
     hour_of_day: int
     user_age: int
@@ -234,7 +234,6 @@ def predict_fraud(
     if recent_txs >= 3:
         result = "FRAUD DETECTED"
         probability = 99.9
-        # Add the rule to the top reasons
         top_reasons = {"Velocity Rule (3+ tx/min)": 10.0, **top_reasons}
 
     # --- 5. SAVE TO DATABASE ---
@@ -266,3 +265,35 @@ def get_history(db: Session = Depends(get_db), current_user: dict = Depends(get_
 def get_all_users(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
     users = db.query(User).all()
     return [{"id": u.id, "username": u.username, "role": u.role} for u in users]
+
+# ==========================================
+# 8. ADMIN DRIFT MONITORING ENDPOINT
+# ==========================================
+@app.get("/admin/drift")
+def check_drift(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
+    # Get the last 100 transactions
+    recent_txs = db.query(Transaction).order_by(Transaction.timestamp.desc()).limit(100).all()
+    
+    if len(recent_txs) < 10:
+        return {"status": "Not enough data", "message": "Need at least 10 transactions to analyze drift."}
+
+    # Calculate the average amount of recent transactions
+    recent_avg_amount = sum([tx.amount for tx in recent_txs]) / len(recent_txs)
+    
+    # The training baseline (our synthetic data averaged around $150)
+    baseline_avg_amount = 150.0 
+    
+    # Statistical Drift Check (If recent avg is 2x higher than baseline)
+    drift_detected = recent_avg_amount > (baseline_avg_amount * 2)
+    
+    # Count fraud vs safe in the recent batch
+    fraud_count = sum([1 for tx in recent_txs if tx.prediction == "FRAUD DETECTED"])
+    fraud_rate = (fraud_count / len(recent_txs)) * 100
+
+    return {
+        "drift_detected": drift_detected,
+        "recent_average_amount": round(recent_avg_amount, 2),
+        "baseline_average_amount": baseline_avg_amount,
+        "recent_fraud_rate_percentage": round(fraud_rate, 2),
+        "message": "🚨 ALERT: Data drift detected! Fraud patterns may have changed." if drift_detected else "✅ System healthy. Data distribution is normal."
+    }
