@@ -111,7 +111,7 @@ def train_model():
 model = train_model()
 
 # ==========================================
-# 5. HELPER FUNCTIONS (VALIDATION)
+# 5. HELPER FUNCTIONS (VALIDATION & BIN DETECTION)
 # ==========================================
 def is_valid_luhn(card_number: str) -> bool:
     clean_number = re.sub(r'[\s-]', '', card_number)
@@ -126,6 +126,19 @@ def is_valid_luhn(card_number: str) -> bool:
         checksum += digit
     return checksum % 10 == 0
 
+def detect_card_network(card_number: str) -> str:
+    clean_number = re.sub(r'[\s-]', '', card_number)
+    if not clean_number: return "Unknown"
+    
+    if re.match(r"^4", clean_number): return "Visa"
+    if re.match(r"^(5[1-5]|2[2-7])", clean_number): return "Mastercard"
+    if re.match(r"^3[47]", clean_number): return "American Express"
+    if re.match(r"^62", clean_number): return "UnionPay"
+    if re.match(r"^(6011|65|64[4-9])", clean_number): return "Discover"
+    if re.match(r"^35", clean_number): return "JCB"
+    
+    return "Unknown"
+
 # ==========================================
 # 6. PYDANTIC SCHEMAS (STRICT VALIDATION)
 # ==========================================
@@ -135,10 +148,8 @@ class UserCreate(BaseModel):
 
     @field_validator('username')
     def validate_username(cls, v):
-        # Must start with a letter
         if not re.match(r"^[a-zA-Z]", v):
             raise ValueError('Username must start with a letter.')
-        # Can only contain letters, numbers, and underscores after the first letter
         if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", v):
             raise ValueError('Username can only contain letters, numbers, and underscores.')
         return v
@@ -154,8 +165,8 @@ class UserCreate(BaseModel):
 class TransactionInput(BaseModel):
     card_network: str = Field(..., description="Visa, Mastercard, or UnionPay")
     card_number: str = Field(..., min_length=16, max_length=19)
-    amount:, float = Field(..., gt le=0, lt=1000000)
-    hour_of_day: int = Field(..., ge=0=23)
+    amount: float = Field(..., gt=0, lt=1000000) # <--- FIXED
+    hour_of_day: int = Field(..., ge=0, le=23)   # <--- FIXED
     user_age: int = Field(..., ge=18, le=120)
     is_international: int = Field(..., ge=0, le=1)
 
@@ -204,6 +215,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
+    detected_network = detect_card_network(tx.card_number)
+    
     one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
     recent_txs = db.query(Transaction).filter(Transaction.card_number == tx.card_number, Transaction.timestamp >= one_minute_ago).count()
 
@@ -222,10 +235,26 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
         probability = 99.9
         top_reasons = {"Velocity Rule (3+ tx/min)": 10.0, **top_reasons}
 
-    new_tx = Transaction(card_network=tx.card_network, card_number=tx.card_number, amount=tx.amount, hour_of_day=tx.hour_of_day, user_age=tx.user_age, is_international=tx.is_international, prediction=result)
+    new_tx = Transaction(
+        card_network=detected_network,
+        card_number=tx.card_number, 
+        amount=tx.amount, 
+        hour_of_day=tx.hour_of_day, 
+        user_age=tx.user_age, 
+        is_international=tx.is_international, 
+        prediction=result
+    )
     db.add(new_tx)
     
-    new_audit = AuditLog(card_network=tx.card_network, card_number=tx.card_number, amount=tx.amount, prediction=result, probability=round(probability * 100, 2), model_version=MODEL_VERSION, risk_factors=json.dumps(top_reasons))
+    new_audit = AuditLog(
+        card_network=detected_network, 
+        card_number=tx.card_number, 
+        amount=tx.amount, 
+        prediction=result, 
+        probability=round(probability * 100, 2), 
+        model_version=MODEL_VERSION, 
+        risk_factors=json.dumps(top_reasons)
+    )
     db.add(new_audit)
     db.commit()
     db.refresh(new_tx)
