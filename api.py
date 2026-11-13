@@ -41,7 +41,7 @@ class User(Base):
 class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
-    card_network = Column(String) # NEW: Visa, Mastercard, UnionPay
+    card_network = Column(String)
     card_number = Column(String)
     amount = Column(Float)
     hour_of_day = Column(Integer)
@@ -135,8 +135,12 @@ class UserCreate(BaseModel):
 
     @field_validator('username')
     def validate_username(cls, v):
-        if not re.match(r"^[a-zA-Z0-9_]+$", v):
-            raise ValueError('Username must contain only letters, numbers, and underscores.')
+        # Must start with a letter
+        if not re.match(r"^[a-zA-Z]", v):
+            raise ValueError('Username must start with a letter.')
+        # Can only contain letters, numbers, and underscores after the first letter
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", v):
+            raise ValueError('Username can only contain letters, numbers, and underscores.')
         return v
 
     @field_validator('password')
@@ -150,8 +154,8 @@ class UserCreate(BaseModel):
 class TransactionInput(BaseModel):
     card_network: str = Field(..., description="Visa, Mastercard, or UnionPay")
     card_number: str = Field(..., min_length=16, max_length=19)
-    amount: float = Field(..., gt=0, lt=1000000)
-    hour_of_day: int = Field(..., ge=0, le=23)
+    amount:, float = Field(..., gt le=0, lt=1000000)
+    hour_of_day: int = Field(..., ge=0=23)
     user_age: int = Field(..., ge=18, le=120)
     is_international: int = Field(..., ge=0, le=1)
 
