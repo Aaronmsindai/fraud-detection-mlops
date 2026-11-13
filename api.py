@@ -6,7 +6,7 @@ from typing import List, Dict
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
@@ -15,9 +15,6 @@ import json
 import random
 import re
 
-# ==========================================
-# 1. DATABASE SETUP
-# ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/fraud_db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -29,7 +26,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # ==========================================
-# 2. DATABASE MODELS
+# DATABASE MODELS
 # ==========================================
 class User(Base):
     __tablename__ = "users"
@@ -49,6 +46,7 @@ class Transaction(Base):
     is_international = Column(Integer)
     ip_address = Column(String) 
     device_id = Column(String)
+    typing_speed = Column(Float) # NEW: Behavioral Biometrics
     prediction = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -66,9 +64,6 @@ class AuditLog(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ==========================================
-# 3. SECURITY & JWT SETUP
-# ==========================================
 SECRET_KEY = "super_secret_bank_key_123"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -99,9 +94,6 @@ def get_current_admin_user(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin": raise HTTPException(status_code=403, detail="Admin only.")
     return current_user
 
-# ==========================================
-# 4. MACHINE LEARNING MODEL
-# ==========================================
 MODEL_VERSION = "1.0.0"
 def train_model():
     df = pd.read_csv("transactions.csv").sample(n=100000, random_state=42)
@@ -112,9 +104,7 @@ def train_model():
     return m
 model = train_model()
 
-# ==========================================
-# 5. HELPER FUNCTIONS (VALIDATION & BIN)
-# ==========================================
+# Helper Functions
 def is_valid_luhn(card_number: str) -> bool:
     clean_number = re.sub(r'[\s-]', '', card_number)
     if not clean_number.isdigit(): return False
@@ -136,7 +126,7 @@ def detect_card_network(card_number: str) -> str:
     return "Unknown"
 
 # ==========================================
-# 6. PYDANTIC SCHEMAS (STRICT VALIDATION)
+# PYDANTIC SCHEMAS
 # ==========================================
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=20)
@@ -144,21 +134,20 @@ class UserCreate(BaseModel):
 
     @field_validator('username')
     def validate_username(cls, v):
-        # Must start with a letter
-        if not re.match(r"^[a-zA-Z]", v):
-            raise ValueError('Username must start with a letter.')
-        # Can only contain letters, numbers, and underscores
-        if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", v):
-            raise ValueError('Username can only contain letters, numbers, and underscores.')
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", v): raise ValueError('Invalid username format.')
         return v
 
     @field_validator('password')
     def validate_password(cls, v):
-        if not re.search(r"[A-Z]", v): raise ValueError("Password must contain an uppercase letter.")
-        if not re.search(r"[a-z]", v): raise ValueError("Password must contain a lowercase letter.")
-        if not re.search(r"\d", v): raise ValueError("Password must contain a number.")
-        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", v): raise ValueError("Password must contain a special character.")
+        if not re.search(r"[A-Z]", v): raise ValueError("Needs an uppercase letter.")
+        if not re.search(r"[a-z]", v): raise ValueError("Needs a lowercase letter.")
+        if not re.search(r"\d", v): raise ValueError("Needs a number.")
+        if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", v): raise ValueError("Needs a special character.")
         return v
+
+class AccountValidationInput(BaseModel):
+    account_number: str
+    routing_number: str
 
 class TransactionInput(BaseModel):
     card_network: str
@@ -169,6 +158,7 @@ class TransactionInput(BaseModel):
     is_international: int = Field(..., ge=0, le=1)
     ip_address: str
     device_id: str = Field(..., min_length=3, max_length=50)
+    typing_speed: float = Field(..., ge=0.0, description="Seconds taken to fill form") # NEW
 
     @field_validator('card_number')
     def validate_card_number(cls, v: str) -> str:
@@ -195,6 +185,7 @@ class HistoryItem(BaseModel):
     user_age: int
     ip_address: str
     device_id: str
+    typing_speed: float
     prediction: str
     timestamp: datetime
     class Config: from_attributes = True
@@ -211,36 +202,63 @@ class AuditLogResponse(BaseModel):
     class Config: from_attributes = True
 
 # ==========================================
-# 7. FASTAPI APP & ROUTES
+# FASTAPI APP & ROUTES
 # ==========================================
 app = FastAPI(title="Bank Fraud Detection API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.post("/verify_account")
+def verify_account(data: AccountValidationInput, current_user: dict = Depends(get_current_user)):
+    # Simulated Nacha/ACH Account Validation
+    # In the real world, this queries a banking API.
+    if len(data.account_number) < 8 or len(data.routing_number) != 9:
+        raise HTTPException(status_code=400, detail="Invalid ACH routing or account number length.")
+    
+    # 90% chance the account is active, 10% chance it's closed/fraudulent
+    is_active = random.random() > 0.10
+    
+    if not is_active:
+        raise HTTPException(status_code=400, detail="Nacha Validation Failed: Account is closed or inactive.")
+    
+    return {"status": "valid", "message": "Account verified and active for ACH transfers."}
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     detected_network = detect_card_network(tx.card_number)
     
+    # 1. Velocity Check
     one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
     recent_txs = db.query(Transaction).filter(Transaction.card_number == tx.card_number, Transaction.timestamp >= one_minute_ago).count()
 
-    # Impossible Travel Simulation
+    # 2. Impossible Travel Check
     impossible_travel = False
     last_tx = db.query(Transaction).filter(Transaction.card_number == tx.card_number).order_by(Transaction.timestamp.desc()).first()
     if last_tx and last_tx.ip_address != tx.ip_address and last_tx.is_international != tx.is_international:
         impossible_travel = True
 
+    # 3. Network Graph Analysis (Fraud Ring Detection)
+    # Check if this device_id has been used by more than 2 distinct card numbers
+    distinct_cards_on_device = db.query(Transaction.card_number).filter(Transaction.device_id == tx.device_id).distinct().count()
+    is_fraud_ring = distinct_cards_on_device >= 2
+
+    # 4. Behavioral Biometrics (Bot Detection)
+    # If typing speed is less than 0.5 seconds, it's a bot
+    is_bot = tx.typing_speed < 0.5
+
+    # ML Model
     input_data = pd.DataFrame([{'amount': tx.amount, 'hour_of_day': tx.hour_of_day, 'user_age': tx.user_age, 'is_international': tx.is_international}])
     prediction = int(model.predict(input_data)[0])
     probability = float(model.predict_proba(input_data)[0][1])
     
-    # 3-Tier RBA
-    if probability > 0.85 or recent_txs >= 3 or impossible_travel:
+    # 5. 3-Tier RBA Decision Engine
+    if probability > 0.85 or recent_txs >= 3 or impossible_travel or is_fraud_ring or is_bot:
         result = "BLOCK"
     elif probability > 0.40:
         result = "STEP-UP AUTH"
     else:
         result = "APPROVE"
 
+    # Explainability
     importances = model.feature_importances_
     feature_names = ['amount', 'hour_of_day', 'user_age', 'is_international']
     explanations = {feature_names[i]: round(float(importances[i] * 10), 2) for i in range(len(feature_names)) if importances[i] > 0.05}
@@ -248,11 +266,14 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
     
     if recent_txs >= 3: top_reasons = {"Velocity Rule": 10.0, **top_reasons}
     if impossible_travel: top_reasons = {"Impossible Travel": 10.0, **top_reasons}
+    if is_fraud_ring: top_reasons = {"Network Fraud Ring (Device shared)": 10.0, **top_reasons}
+    if is_bot: top_reasons = {"Behavioral Biometrics (Bot speed)": 10.0, **top_reasons}
 
+    # Save
     new_tx = Transaction(
         card_network=detected_network, card_number=tx.card_number, amount=tx.amount, 
         hour_of_day=tx.hour_of_day, user_age=tx.user_age, is_international=tx.is_international, 
-        ip_address=tx.ip_address, device_id=tx.device_id, prediction=result
+        ip_address=tx.ip_address, device_id=tx.device_id, typing_speed=tx.typing_speed, prediction=result
     )
     db.add(new_tx)
     db.add(AuditLog(card_network=detected_network, card_number=tx.card_number, amount=tx.amount, prediction=result, probability=round(probability * 100, 2), model_version=MODEL_VERSION, risk_factors=json.dumps(top_reasons)))
