@@ -6,7 +6,7 @@ from typing import List, Dict
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 import pandas as pd
 import os
@@ -46,7 +46,7 @@ class Transaction(Base):
     is_international = Column(Integer)
     ip_address = Column(String) 
     device_id = Column(String)
-    typing_speed = Column(Float) # NEW: Behavioral Biometrics
+    typing_speed = Column(Float)
     prediction = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
@@ -62,8 +62,28 @@ class AuditLog(Base):
     model_version = Column(String)
     risk_factors = Column(String)
 
+# NEW: Maker-Checker Dual Approval Workflow
+class PendingWire(Base):
+    __tablename__ = "pending_wires"
+    id = Column(Integer, primary_key=True, index=True)
+    initiator_id = Column(Integer)
+    card_number = Column(String)
+    amount = Column(Float)
+    status = Column(String, default="PENDING") # PENDING, APPROVED, REJECTED
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# NEW: SAR (Suspicious Activity Report) Log
+class SARLog(Base):
+    __tablename__ = "sar_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    transaction_id = Column(Integer)
+    reason = Column(String)
+    reported_to_fincen = Column(Boolean, default=True)
+
 Base.metadata.create_all(bind=engine)
 
+# SECURITY
 SECRET_KEY = "super_secret_bank_key_123"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -77,7 +97,6 @@ def get_db():
 
 def verify_password(plain_password, hashed_password): return pwd_context.verify(plain_password, hashed_password)
 def get_password_hash(password): return pwd_context.hash(password)
-
 def create_access_token(data: dict):
     to_encode = data.copy()
     to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)})
@@ -94,6 +113,7 @@ def get_current_admin_user(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin": raise HTTPException(status_code=403, detail="Admin only.")
     return current_user
 
+# ML MODEL
 MODEL_VERSION = "1.0.0"
 def train_model():
     df = pd.read_csv("transactions.csv").sample(n=100000, random_state=42)
@@ -104,7 +124,7 @@ def train_model():
     return m
 model = train_model()
 
-# Helper Functions
+# HELPERS
 def is_valid_luhn(card_number: str) -> bool:
     clean_number = re.sub(r'[\s-]', '', card_number)
     if not clean_number.isdigit(): return False
@@ -125,18 +145,14 @@ def detect_card_network(card_number: str) -> str:
     if re.match(r"^62", clean_number): return "UnionPay"
     return "Unknown"
 
-# ==========================================
-# PYDANTIC SCHEMAS
-# ==========================================
+# SCHEMAS
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=20)
     password: str = Field(..., min_length=8)
-
     @field_validator('username')
     def validate_username(cls, v):
         if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", v): raise ValueError('Invalid username format.')
         return v
-
     @field_validator('password')
     def validate_password(cls, v):
         if not re.search(r"[A-Z]", v): raise ValueError("Needs an uppercase letter.")
@@ -158,13 +174,13 @@ class TransactionInput(BaseModel):
     is_international: int = Field(..., ge=0, le=1)
     ip_address: str
     device_id: str = Field(..., min_length=3, max_length=50)
-    typing_speed: float = Field(..., ge=0.0, description="Seconds taken to fill form") # NEW
+    typing_speed: float = Field(..., ge=0.0)
+    is_wire_transfer: int = Field(default=0, description="1 if this is a high-value wire transfer")
 
     @field_validator('card_number')
     def validate_card_number(cls, v: str) -> str:
         if not is_valid_luhn(v): raise ValueError('Invalid card number (Luhn check failed).')
         return v
-
     @field_validator('ip_address')
     def validate_ip_address(cls, v: str) -> str:
         ip_regex = r"^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
@@ -176,21 +192,22 @@ class PredictionResponse(BaseModel):
     fraud_probability: float
     timestamp: datetime
     risk_factors: Dict[str, float]
+    requires_dual_approval: bool = False
+    wire_id: int = None
 
 class HistoryItem(BaseModel):
+    id: int
     card_network: str
     card_number: str
     amount: float
     hour_of_day: int
     user_age: int
-    ip_address: str
-    device_id: str
-    typing_speed: float
     prediction: str
     timestamp: datetime
     class Config: from_attributes = True
 
 class AuditLogResponse(BaseModel):
+    id: int
     timestamp: datetime
     card_network: str
     card_number: str
@@ -198,7 +215,22 @@ class AuditLogResponse(BaseModel):
     prediction: str
     probability: float
     model_version: str
-    risk_factors: str
+    class Config: from_attributes = True
+
+class WireResponse(BaseModel):
+    id: int
+    card_number: str
+    amount: float
+    status: str
+    timestamp: datetime
+    class Config: from_attributes = True
+
+class SARResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    transaction_id: int
+    reason: str
+    reported_to_fincen: bool
     class Config: from_attributes = True
 
 # ==========================================
@@ -209,40 +241,31 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 @app.post("/verify_account")
 def verify_account(data: AccountValidationInput, current_user: dict = Depends(get_current_user)):
-    # Simulated Nacha/ACH Account Validation
-    # In the real world, this queries a banking API.
     if len(data.account_number) < 8 or len(data.routing_number) != 9:
         raise HTTPException(status_code=400, detail="Invalid ACH routing or account number length.")
-    
-    # 90% chance the account is active, 10% chance it's closed/fraudulent
     is_active = random.random() > 0.10
-    
-    if not is_active:
-        raise HTTPException(status_code=400, detail="Nacha Validation Failed: Account is closed or inactive.")
-    
+    if not is_active: raise HTTPException(status_code=400, detail="Nacha Validation Failed: Account is closed.")
     return {"status": "valid", "message": "Account verified and active for ACH transfers."}
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     detected_network = detect_card_network(tx.card_number)
     
-    # 1. Velocity Check
+    # 1. Velocity
     one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
     recent_txs = db.query(Transaction).filter(Transaction.card_number == tx.card_number, Transaction.timestamp >= one_minute_ago).count()
 
-    # 2. Impossible Travel Check
+    # 2. Impossible Travel
     impossible_travel = False
     last_tx = db.query(Transaction).filter(Transaction.card_number == tx.card_number).order_by(Transaction.timestamp.desc()).first()
     if last_tx and last_tx.ip_address != tx.ip_address and last_tx.is_international != tx.is_international:
         impossible_travel = True
 
-    # 3. Network Graph Analysis (Fraud Ring Detection)
-    # Check if this device_id has been used by more than 2 distinct card numbers
+    # 3. Fraud Ring
     distinct_cards_on_device = db.query(Transaction.card_number).filter(Transaction.device_id == tx.device_id).distinct().count()
     is_fraud_ring = distinct_cards_on_device >= 2
 
-    # 4. Behavioral Biometrics (Bot Detection)
-    # If typing speed is less than 0.5 seconds, it's a bot
+    # 4. Bot Detection
     is_bot = tx.typing_speed < 0.5
 
     # ML Model
@@ -250,7 +273,7 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
     prediction = int(model.predict(input_data)[0])
     probability = float(model.predict_proba(input_data)[0][1])
     
-    # 5. 3-Tier RBA Decision Engine
+    # 5. RBA
     if probability > 0.85 or recent_txs >= 3 or impossible_travel or is_fraud_ring or is_bot:
         result = "BLOCK"
     elif probability > 0.40:
@@ -266,21 +289,38 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
     
     if recent_txs >= 3: top_reasons = {"Velocity Rule": 10.0, **top_reasons}
     if impossible_travel: top_reasons = {"Impossible Travel": 10.0, **top_reasons}
-    if is_fraud_ring: top_reasons = {"Network Fraud Ring (Device shared)": 10.0, **top_reasons}
-    if is_bot: top_reasons = {"Behavioral Biometrics (Bot speed)": 10.0, **top_reasons}
+    if is_fraud_ring: top_reasons = {"Fraud Ring": 10.0, **top_reasons}
+    if is_bot: top_reasons = {"Bot Behavior": 10.0, **top_reasons}
 
-    # Save
+    # Save Transaction
     new_tx = Transaction(
         card_network=detected_network, card_number=tx.card_number, amount=tx.amount, 
         hour_of_day=tx.hour_of_day, user_age=tx.user_age, is_international=tx.is_international, 
         ip_address=tx.ip_address, device_id=tx.device_id, typing_speed=tx.typing_speed, prediction=result
     )
     db.add(new_tx)
-    db.add(AuditLog(card_network=detected_network, card_number=tx.card_number, amount=tx.amount, prediction=result, probability=round(probability * 100, 2), model_version=MODEL_VERSION, risk_factors=json.dumps(top_reasons)))
+    
+    new_audit = AuditLog(card_network=detected_network, card_number=tx.card_number, amount=tx.amount, prediction=result, probability=round(probability * 100, 2), model_version=MODEL_VERSION, risk_factors=json.dumps(top_reasons))
+    db.add(new_audit)
     db.commit()
     db.refresh(new_tx)
+
+    # Maker-Checker: High Value Wire Transfers require dual approval
+    requires_dual_approval = False
+    wire_id = None
+    if tx.is_wire_transfer == 1 and result == "APPROVE":
+        new_wire = PendingWire(initiator_id=1, card_number=tx.card_number, amount=tx.amount)
+        db.add(new_wire)
+        db.commit()
+        db.refresh(new_wire)
+        requires_dual_approval = True
+        wire_id = new_wire.id
     
-    return {"prediction": result, "fraud_probability": round(probability * 100, 2), "timestamp": new_tx.timestamp, "risk_factors": top_reasons}
+    return {
+        "prediction": result, "fraud_probability": round(probability * 100, 2), 
+        "timestamp": new_tx.timestamp, "risk_factors": top_reasons,
+        "requires_dual_approval": requires_dual_approval, "wire_id": wire_id
+    }
 
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -296,8 +336,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password): 
         raise HTTPException(status_code=401, detail="Incorrect username or password")
-    access_token = create_access_token(data={"sub": user.username, "role": user.role})
-    return {"access_token": access_token, "token_type": "bearer", "role": user.role}
+    token = create_access_token(data={"sub": user.username, "role": user.role})
+    return {"access_token": token, "token_type": "bearer", "role": user.role}
 
 @app.get("/history", response_model=List[HistoryItem])
 def get_history(db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
@@ -321,3 +361,34 @@ def check_drift(db: Session = Depends(get_db), current_user: dict = Depends(get_
     recent_avg = sum([tx.amount for tx in recent_txs]) / len(recent_txs)
     drift = recent_avg > 300.0
     return {"drift_detected": drift, "recent_average_amount": round(recent_avg, 2), "baseline_average_amount": 150.0, "recent_fraud_rate_percentage": round((sum([1 for tx in recent_txs if tx.prediction == "BLOCK"]) / len(recent_txs)) * 100, 2), "message": "🚨 ALERT: Data drift detected!" if drift else "✅ System healthy."}
+
+# ==========================================
+# NEW: COMPLIANCE ENDPOINTS
+# ==========================================
+@app.get("/admin/wires", response_model=List[WireResponse])
+def get_pending_wires(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
+    return db.query(PendingWire).order_by(PendingWire.timestamp.desc()).all()
+
+@app.post("/admin/wires/{wire_id}/approve")
+def approve_wire(wire_id: int, db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
+    wire = db.query(PendingWire).filter(PendingWire.id == wire_id).first()
+    if not wire: raise HTTPException(status_code=404, detail="Wire not found")
+    if wire.status != "PENDING": raise HTTPException(status_code=400, detail="Wire already processed")
+    wire.status = "APPROVED"
+    db.commit()
+    return {"message": "Wire transfer approved and funds released."}
+
+@app.post("/admin/generate_sar/{audit_id}")
+def generate_sar(audit_id: int, db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
+    audit = db.query(AuditLog).filter(AuditLog.id == audit_id).first()
+    if not audit: raise HTTPException(status_code=404, detail="Audit log not found")
+    
+    # In a real bank, this creates an XML file and sends it to FinCEN.
+    new_sar = SARLog(transaction_id=audit_id, reason=f"Fraud blocked: {audit.risk_factors}")
+    db.add(new_sar)
+    db.commit()
+    return {"message": f"SAR successfully filed to FinCEN for Transaction #{audit_id}"}
+
+@app.get("/admin/sars", response_model=List[SARResponse])
+def get_sars(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
+    return db.query(SARLog).order_by(SARLog.timestamp.desc()).all()
