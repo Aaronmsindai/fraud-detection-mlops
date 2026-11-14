@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Dict
+from typing import List, Dict, Optional  # <--- ADDED Optional HERE
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -71,7 +71,7 @@ class PendingWire(Base):
     initiator_id = Column(Integer)
     card_number = Column(String)
     amount = Column(Float)
-    status = Column(String, default="PENDING") # PENDING, APPROVED, REJECTED
+    status = Column(String, default="PENDING") 
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 class SARLog(Base):
@@ -153,7 +153,7 @@ def detect_card_network(card_number: str) -> str:
     return "Unknown"
 
 # ==========================================
-# 6. PYDANTIC SCHEMAS
+# 6. PYDANTIC SCHEMAS (FIXED!)
 # ==========================================
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=20)
@@ -206,7 +206,7 @@ class PredictionResponse(BaseModel):
     timestamp: datetime
     risk_factors: Dict[str, float]
     requires_dual_approval: bool = False
-    wire_id: int = None
+    wire_id: Optional[int] = None  # <--- FIXED HERE
 
 class HistoryItem(BaseModel):
     id: int
@@ -251,7 +251,6 @@ class SARResponse(BaseModel):
 # ==========================================
 app = FastAPI(title="Bank Fraud Detection API")
 
-# FIXED CORS: Must be allow_credentials=False when using allow_origins=["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -272,29 +271,23 @@ def verify_account(data: AccountValidationInput, current_user: dict = Depends(ge
 def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_user: dict = Depends(get_current_user)):
     detected_network = detect_card_network(tx.card_number)
     
-    # 1. Velocity Check
     one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
     recent_txs = db.query(Transaction).filter(Transaction.card_number == tx.card_number, Transaction.timestamp >= one_minute_ago).count()
 
-    # 2. Impossible Travel Check
     impossible_travel = False
     last_tx = db.query(Transaction).filter(Transaction.card_number == tx.card_number).order_by(Transaction.timestamp.desc()).first()
     if last_tx and last_tx.ip_address != tx.ip_address and last_tx.is_international != tx.is_international:
         impossible_travel = True
 
-    # 3. Network Graph Analysis (Fraud Ring)
     distinct_cards_on_device = db.query(Transaction.card_number).filter(Transaction.device_id == tx.device_id).distinct().count()
     is_fraud_ring = distinct_cards_on_device >= 2
 
-    # 4. Behavioral Biometrics (Bot Detection)
     is_bot = tx.typing_speed < 0.5
 
-    # 5. ML Model Inference
     input_data = pd.DataFrame([{'amount': tx.amount, 'hour_of_day': tx.hour_of_day, 'user_age': tx.user_age, 'is_international': tx.is_international}])
     prediction = int(model.predict(input_data)[0])
     probability = float(model.predict_proba(input_data)[0][1])
     
-    # 6. 3-Tier RBA Decision Engine
     if probability > 0.85 or recent_txs >= 3 or impossible_travel or is_fraud_ring or is_bot:
         result = "BLOCK"
     elif probability > 0.40:
@@ -302,7 +295,6 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
     else:
         result = "APPROVE"
 
-    # 7. Explainability
     importances = model.feature_importances_
     feature_names = ['amount', 'hour_of_day', 'user_age', 'is_international']
     explanations = {feature_names[i]: round(float(importances[i] * 10), 2) for i in range(len(feature_names)) if importances[i] > 0.05}
@@ -313,7 +305,6 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
     if is_fraud_ring: top_reasons = {"Fraud Ring": 10.0, **top_reasons}
     if is_bot: top_reasons = {"Bot Behavior": 10.0, **top_reasons}
 
-    # 8. Save Transaction
     new_tx = Transaction(
         card_network=detected_network, card_number=tx.card_number, amount=tx.amount, 
         hour_of_day=tx.hour_of_day, user_age=tx.user_age, is_international=tx.is_international, 
@@ -321,13 +312,11 @@ def predict_fraud(tx: TransactionInput, db: Session = Depends(get_db), current_u
     )
     db.add(new_tx)
     
-    # 9. Save Audit Log
     new_audit = AuditLog(card_network=detected_network, card_number=tx.card_number, amount=tx.amount, prediction=result, probability=round(probability * 100, 2), model_version=MODEL_VERSION, risk_factors=json.dumps(top_reasons))
     db.add(new_audit)
     db.commit()
     db.refresh(new_tx)
 
-    # 10. Maker-Checker: High Value Wire Transfers require dual approval
     requires_dual_approval = False
     wire_id = None
     if tx.is_wire_transfer == 1 and result == "APPROVE":
@@ -384,9 +373,6 @@ def check_drift(db: Session = Depends(get_db), current_user: dict = Depends(get_
     drift = recent_avg > 300.0
     return {"drift_detected": drift, "recent_average_amount": round(recent_avg, 2), "baseline_average_amount": 150.0, "recent_fraud_rate_percentage": round((sum([1 for tx in recent_txs if tx.prediction == "BLOCK"]) / len(recent_txs)) * 100, 2), "message": "🚨 ALERT: Data drift detected!" if drift else "✅ System healthy."}
 
-# ==========================================
-# 8. COMPLIANCE ENDPOINTS (Maker-Checker & SAR)
-# ==========================================
 @app.get("/admin/wires", response_model=List[WireResponse])
 def get_pending_wires(db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
     return db.query(PendingWire).order_by(PendingWire.timestamp.desc()).all()
@@ -404,7 +390,6 @@ def approve_wire(wire_id: int, db: Session = Depends(get_db), current_user: dict
 def generate_sar(audit_id: int, db: Session = Depends(get_db), current_user: dict = Depends(get_current_admin_user)):
     audit = db.query(AuditLog).filter(AuditLog.id == audit_id).first()
     if not audit: raise HTTPException(status_code=404, detail="Audit log not found")
-    
     new_sar = SARLog(transaction_id=audit_id, reason=f"Fraud blocked: {audit.risk_factors}")
     db.add(new_sar)
     db.commit()
